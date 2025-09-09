@@ -29,88 +29,334 @@ def set_seed(seed=42):
 
 set_seed(42)
 
-# Cluster environment setup
-def setup_cluster_environment():
-    """Setup environment for cluster execution"""
+# =================== GLOBAL EARLY STOPPING FRAMEWORK ===================
 
-    # Set matplotlib backend
-    plt.ioff()  # Turn off interactive plotting
-
-    # Check CUDA availability
-    if torch.cuda.is_available():
-        print(f"✅ CUDA available: {torch.cuda.get_device_name()}")
-        print(f"   Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
-    else:
-        print("❌ CUDA not available, using CPU")
-
-    # Create necessary directories
-    os.makedirs('./data', exist_ok=True)
-    os.makedirs('./results', exist_ok=True)
-    os.makedirs('./plots', exist_ok=True)
-
-    print("🔧 Cluster environment setup complete")
-
-# Modify the plotting functions to save instead of show
-def save_plot_instead_of_show():
-    """Replace plt.show() with plt.savefig() for cluster"""
-    original_show = plt.show
-
-    def cluster_show(filename_prefix="plot"):
-        timestamp = int(time.time())
-        filename = f"./plots/{filename_prefix}_{timestamp}.png"
-        plt.savefig(filename, dpi=300, bbox_inches='tight', facecolor='white')
-        print(f"📊 Plot saved: {filename}")
-        plt.close()  # Close to free memory
-
-    plt.show = cluster_show
-
-# Memory management for large experiments
-def optimize_for_cluster():
-    """Optimize settings for cluster environment"""
-
-    # Reduce batch size if memory constrained
-    if torch.cuda.is_available():
-        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
-        if gpu_memory < 8:  # Less than 8GB
-            print("⚠️  Limited GPU memory detected, reducing batch size")
-            return {'batch_size': 32, 'num_clients': 25}
-
-    return {'batch_size': 64, 'num_clients': 50}
-
-# Add error handling wrapper
-def safe_experiment_runner(func, *args, **kwargs):
-    """Run experiment with error handling"""
-    try:
-        return func(*args, **kwargs)
-    except RuntimeError as e:
-        if "out of memory" in str(e).lower():
-            print("❌ GPU out of memory! Trying with reduced settings...")
-            torch.cuda.empty_cache()
-            # Reduce parameters and try again
-            if 'num_clients' in kwargs:
-                kwargs['num_clients'] = max(10, kwargs['num_clients'] // 2)
-            if 'max_local_epochs' in kwargs:
-                kwargs['max_local_epochs'] = max(5, kwargs['max_local_epochs'] // 2)
-            return func(*args, **kwargs)
+class GlobalConvergenceTracker:
+    """
+    Research-grade global convergence tracking with early stopping
+    """
+    def __init__(self, dataset_name, patience=15, accuracy_plateau=0.1, min_rounds=50):
+        self.dataset_name = dataset_name
+        self.patience = patience
+        self.accuracy_plateau = accuracy_plateau
+        self.min_rounds = min_rounds
+        
+        # Dataset-specific convergence thresholds
+        self.convergence_thresholds = {
+            'MNIST': 95.0,        # Easy dataset - high threshold
+            'Fashion-MNIST': 85.0, # Moderate dataset - medium threshold  
+            'CIFAR-10': 75.0      # Hard dataset - lower threshold
+        }
+        
+        self.min_accuracy = self.convergence_thresholds.get(dataset_name, 85.0)
+        
+        # Tracking variables
+        self.no_improvement_count = 0
+        self.best_accuracy = 0.0
+        self.convergence_round = None
+        self.converged = False
+        self.accuracy_history = []
+        
+    def update_accuracy(self, current_accuracy, round_num):
+        """Update accuracy and check for convergence"""
+        self.accuracy_history.append(current_accuracy)
+        
+        # Don't check convergence until minimum rounds
+        if round_num < self.min_rounds:
+            return False
+            
+        # Check for improvement
+        if current_accuracy > self.best_accuracy + self.accuracy_plateau:
+            self.best_accuracy = current_accuracy
+            self.no_improvement_count = 0
         else:
-            raise e
-    except Exception as e:
-        print(f"❌ Experiment failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
+            self.no_improvement_count += 1
+            
+        # Check convergence criteria
+        accuracy_threshold_met = current_accuracy >= self.min_accuracy
+        plateau_reached = self.no_improvement_count >= self.patience
+        
+        if accuracy_threshold_met and plateau_reached and not self.converged:
+            self.convergence_round = round_num
+            self.converged = True
+            return True
+            
+        return False
+        
+    def get_convergence_info(self):
+        """Get comprehensive convergence information"""
+        return {
+            'converged': self.converged,
+            'convergence_round': self.convergence_round,
+            'best_accuracy': self.best_accuracy,
+            'final_accuracy': self.accuracy_history[-1] if self.accuracy_history else 0.0,
+            'min_accuracy_threshold': self.min_accuracy,
+            'rounds_to_convergence': self.convergence_round if self.converged else None,
+            'accuracy_at_convergence': self.best_accuracy if self.converged else None
+        }
 
-# --- 1. Enhanced Fashion-MNIST Neural Network ---
-class FashionMNISTNet(nn.Module):
-    def __init__(self, input_size=784, hidden_sizes=[512, 256, 128, 64], num_classes=10, dropout_rate=0.25):
-        super(FashionMNISTNet, self).__init__()
+# =================== RESEARCH-GRADE JSON SERIALIZATION ===================
+
+def safe_serialize_value(value):
+    """Recursively convert values to JSON-safe types (Research Standard)"""
+    if isinstance(value, (np.integer, np.int64, np.int32)):
+        return int(value)
+    elif isinstance(value, (np.floating, np.float64, np.float32)):
+        return float(value)
+    elif isinstance(value, np.ndarray):
+        return value.tolist()
+    elif isinstance(value, list):
+        return [safe_serialize_value(item) for item in value]
+    elif isinstance(value, dict):
+        return {str(k): safe_serialize_value(v) for k, v in value.items()}
+    elif isinstance(value, defaultdict):
+        return {str(k): safe_serialize_value(v) for k, v in dict(value).items()}
+    elif isinstance(value, set):
+        return list(value)
+    return value
+
+def prepare_results_for_json(results):
+    """Convert all results to JSON-serializable format (Publication Standard)"""
+    return {str(key): safe_serialize_value(value) for key, value in results.items()}
+
+# =================== ENHANCED STRAGGLER TRACKING ===================
+
+class ResearchGradeStragglerTracker:
+    """Research-grade straggler tracking following FL literature best practices"""
+    def __init__(self, num_clients, client_speeds, straggler_threshold=1.5):
+        self.num_clients = num_clients
+        self.client_speeds = client_speeds
+        self.straggler_threshold = straggler_threshold
+
+        # Track stragglers by capability vs performance
+        self.round_stragglers = []
+        self.client_straggler_history = {cid: [] for cid in range(num_clients)}
+        self.total_stragglers_per_round = []
+
+        # Enhanced participation tracking
+        self.participation_metrics = {
+            'slow_capable_clients': [i for i, speed in enumerate(client_speeds) if speed < 0.8],
+            'normal_capable_clients': [i for i, speed in enumerate(client_speeds) if 0.8 <= speed <= 1.2],
+            'fast_capable_clients': [i for i, speed in enumerate(client_speeds) if speed > 1.2],
+        }
+
+        self.accommodation_history = []
+
+    def identify_round_stragglers_with_participation(self, client_times, round_num):
+        """Enhanced straggler identification with participation analysis"""
+        median_time = float(np.median(client_times))
+        threshold = median_time * self.straggler_threshold
+
+        round_stragglers = []
+        for cid, time_taken in enumerate(client_times):
+            is_straggler = time_taken > threshold
+            round_stragglers.append(is_straggler)
+            self.client_straggler_history[cid].append(is_straggler)
+
+        straggler_count = int(sum(round_stragglers))
+        self.round_stragglers.append(round_stragglers)
+        self.total_stragglers_per_round.append(straggler_count)
+
+        participation_analysis = self.analyze_participation_capability(client_times, threshold)
+        self.accommodation_history.append(participation_analysis)
+
+        return round_stragglers, straggler_count, participation_analysis
+
+    def analyze_participation_capability(self, client_times, threshold):
+        """Analyze algorithm's ability to accommodate vs exclude stragglers"""
+        slow_clients = self.participation_metrics['slow_capable_clients']
+        normal_clients = self.participation_metrics['normal_capable_clients']
+        fast_clients = self.participation_metrics['fast_capable_clients']
+
+        accommodation_threshold = threshold * 1.2
+
+        successful_slow = sum(1 for cid in slow_clients if client_times[cid] <= accommodation_threshold)
+        successful_normal = sum(1 for cid in normal_clients if client_times[cid] <= threshold)
+        successful_fast = sum(1 for cid in fast_clients if client_times[cid] <= threshold)
+
+        total_slow = len(slow_clients)
+        total_normal = len(normal_clients)
+        total_fast = len(fast_clients)
+
+        return {
+            'total_clients': self.num_clients,
+            'slow_capable_clients': total_slow,
+            'normal_capable_clients': total_normal,
+            'fast_capable_clients': total_fast,
+            'successful_slow_participation': successful_slow,
+            'successful_normal_participation': successful_normal,
+            'successful_fast_participation': successful_fast,
+            'slow_inclusion_rate': successful_slow / max(total_slow, 1),
+            'normal_inclusion_rate': successful_normal / max(total_normal, 1),
+            'fast_inclusion_rate': successful_fast / max(total_fast, 1),
+            'stragglers_accommodated': successful_slow,
+            'stragglers_excluded': total_slow - successful_slow,
+            'accommodation_efficiency': successful_slow / max(total_slow, 1)
+        }
+
+    def get_comprehensive_straggler_statistics(self):
+        """Research-grade comprehensive straggler statistics"""
+        if not self.total_stragglers_per_round:
+            return {}
+
+        avg_stragglers = float(np.mean(self.total_stragglers_per_round))
+        straggler_rate = avg_stragglers / self.num_clients
+
+        if self.accommodation_history:
+            avg_accommodation = float(np.mean([h['accommodation_efficiency'] for h in self.accommodation_history]))
+            avg_slow_inclusion = float(np.mean([h['slow_inclusion_rate'] for h in self.accommodation_history]))
+        else:
+            avg_accommodation = 0.0
+            avg_slow_inclusion = 0.0
+
+        persistent_stragglers = self.get_persistent_stragglers()
+
+        return {
+            'avg_stragglers_per_round': avg_stragglers,
+            'max_stragglers_in_round': int(max(self.total_stragglers_per_round)),
+            'min_stragglers_in_round': int(min(self.total_stragglers_per_round)),
+            'straggler_rate': straggler_rate,
+            'persistent_stragglers': persistent_stragglers,
+            'straggler_variance': float(np.var(self.total_stragglers_per_round)),
+            'avg_accommodation_efficiency': avg_accommodation,
+            'avg_slow_inclusion_rate': avg_slow_inclusion,
+            'total_slow_devices': len(self.participation_metrics['slow_capable_clients']),
+            'accommodation_success_score': avg_accommodation * avg_slow_inclusion
+        }
+
+    def get_persistent_stragglers(self, persistence_threshold=0.7):
+        """Identify clients that are frequently stragglers"""
+        persistent = []
+        for cid, history in self.client_straggler_history.items():
+            if len(history) > 0:
+                rate = sum(history) / len(history)
+                if rate >= persistence_threshold:
+                    persistent.append(int(cid))
+        return persistent
+
+# =================== ENHANCED EFFICIENCY TRACKING ===================
+
+class ResearchGradeEfficiencyTracker:
+    """Research-grade efficiency tracking for MLP federated learning"""
+    def __init__(self, num_clients):
+        self.num_clients = num_clients
+        self.client_flops = defaultdict(list)
+        self.client_memory_usage = defaultdict(list)
+        self.client_energy_estimate = defaultdict(list)
+        self.client_communication_costs = defaultdict(list)
+        self.total_communication_per_round = []
+        self.communication_breakdown = defaultdict(list)
+        self.convergence_efficiency = {}
+        self.parameter_efficiency = defaultdict(list)
+
+    def start_client_monitoring(self, client_id):
+        """Start monitoring computational resources"""
+        return {
+            'start_time': time.time(),
+            'start_memory': torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
+        }
+
+    def calculate_mlp_training_flops(self, model, batch_size, active_layers_count):
+        """Calculate accurate MLP training FLOPs following ML literature standards"""
+        total_flops = 0
+        linear_layers = [module for module in model.model.modules() if isinstance(module, nn.Linear)]
+        active_layers = linear_layers[:active_layers_count] if active_layers_count <= len(linear_layers) else linear_layers
+
+        for layer in active_layers:
+            forward_flops = batch_size * layer.in_features * layer.out_features
+            backward_flops = 2 * forward_flops
+            layer_flops = forward_flops + backward_flops
+            total_flops += layer_flops
+
+        return int(total_flops)
+
+    def calculate_federated_communication_cost(self, strategy, full_model_state_dict, active_layers_count):
+        """Calculate bidirectional communication cost with protocol overhead"""
+        full_model_size = 0
+        for param in full_model_state_dict.values():
+            full_model_size += param.numel() * 4
+
+        active_model_size = 0
+        linear_layers = [name for name in full_model_state_dict.keys()
+                        if 'weight' in name or 'bias' in name]
+
+        total_layers = len([name for name in linear_layers if 'weight' in name])
+        if total_layers > 0:
+            layers_to_include = min(active_layers_count, total_layers)
+            layers_to_skip = max(0, total_layers - layers_to_include)
+
+            layer_count = 0
+            for name, param in full_model_state_dict.items():
+                if 'weight' in name:
+                    if layer_count >= layers_to_skip:
+                        active_model_size += param.numel() * 4
+                        bias_name = name.replace('weight', 'bias')
+                        if bias_name in full_model_state_dict:
+                            active_model_size += full_model_state_dict[bias_name].numel() * 4
+                    layer_count += 1
+
+        if strategy == "fedavg":
+            downstream_bytes = full_model_size
+            upstream_bytes = full_model_size
+        elif strategy in ["fedpmt", "feddrop", "dla"]:
+            downstream_bytes = full_model_size
+            upstream_bytes = active_model_size
+        else:
+            downstream_bytes = full_model_size
+            upstream_bytes = full_model_size
+
+        protocol_overhead = (downstream_bytes + upstream_bytes) * 0.05
+        total_communication = downstream_bytes + upstream_bytes + protocol_overhead
+
+        return {
+            'downstream_bytes': int(downstream_bytes),
+            'upstream_bytes': int(upstream_bytes),
+            'protocol_overhead': int(protocol_overhead),
+            'total_bytes': int(total_communication),
+            'full_model_size': int(full_model_size),
+            'active_model_size': int(active_model_size)
+        }
+
+    def end_client_monitoring(self, client_id, start_metrics, model_state_dict,
+                             layer_depth, strategy, batch_size=64):
+        """End monitoring and calculate comprehensive efficiency metrics"""
+        end_time = time.time()
+        end_memory = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
+
+        training_time = end_time - start_metrics['start_time']
+        memory_used = abs(end_memory - start_metrics['start_memory'])
+
+        temp_model = MNISTNet()
+        flops = self.calculate_mlp_training_flops(temp_model, batch_size, layer_depth)
+        comm_cost = self.calculate_federated_communication_cost(strategy, model_state_dict, layer_depth)
+        estimated_energy = training_time * 40.0
+
+        self.client_flops[client_id].append(flops)
+        self.client_memory_usage[client_id].append(int(memory_used))
+        self.client_energy_estimate[client_id].append(estimated_energy)
+        self.client_communication_costs[client_id].append(comm_cost['total_bytes'])
+
+        return {
+            'training_time': training_time,
+            'flops': flops,
+            'communication_cost': comm_cost,
+            'energy': estimated_energy,
+            'memory_used': int(memory_used)
+        }
+
+# =================== MNIST MODEL ARCHITECTURE ===================
+
+class MNISTNet(nn.Module):
+    """Research-grade MNIST neural network architecture"""
+    def __init__(self, input_size=784, hidden_sizes=[512, 256, 128, 64], num_classes=10, dropout_rate=0.3):
+        super(MNISTNet, self).__init__()
         layers = []
         prev_size = input_size
 
         for i, hidden_size in enumerate(hidden_sizes):
             layers.append(nn.Linear(prev_size, hidden_size))
             layers.append(nn.ReLU())
-            if i < len(hidden_sizes) - 1:  # No dropout before last hidden layer
+            if i < len(hidden_sizes) - 1:
                 layers.append(nn.Dropout(dropout_rate))
             prev_size = hidden_size
 
@@ -120,11 +366,8 @@ class FashionMNISTNet(nn.Module):
     def forward(self, x):
         return self.model(x)
 
-# --- 2. Apply layer mask to control backprop ---
 def apply_layer_mask(model, layers_to_update):
-    """
-    Apply mask to update only the last 'layers_to_update' layers.
-    """
+    """Apply mask to update only the last 'layers_to_update' layers"""
     all_layers = [module for module in model.model.modules()
                   if isinstance(module, nn.Linear)]
 
@@ -138,12 +381,11 @@ def apply_layer_mask(model, layers_to_update):
         if hasattr(layer, 'bias') and layer.bias is not None:
             layer.bias.requires_grad = requires_grad
 
-# --- 3. Enhanced Local Training with Early Stopping ---
-def train_locally_with_early_stopping(model, train_loader, val_loader, layers_to_update, device,
-                                     client_speed=1.0, max_epochs=15, lr=0.001, patience=5):
-    """
-    Enhanced local training with early stopping and validation monitoring for Fashion-MNIST
-    """
+# =================== ENHANCED TRAINING FUNCTIONS ===================
+
+def train_locally_with_monitoring(model, train_loader, val_loader, layers_to_update, device,
+                                 client_speed=1.0, max_epochs=15, lr=0.001, patience=5):
+    """Enhanced local training with comprehensive monitoring"""
     model = copy.deepcopy(model).to(device)
     apply_layer_mask(model, layers_to_update)
 
@@ -152,19 +394,16 @@ def train_locally_with_early_stopping(model, train_loader, val_loader, layers_to
 
     start_time = time.time()
 
-    # Early stopping variables
     best_val_loss = float('inf')
     patience_counter = 0
     best_model_state = None
 
-    # Training history
     train_losses = []
     val_losses = []
     val_accuracies = []
 
     model.train()
     for epoch in range(max_epochs):
-        # Training phase
         epoch_train_loss = 0
         num_batches = 0
 
@@ -178,14 +417,12 @@ def train_locally_with_early_stopping(model, train_loader, val_loader, layers_to
             epoch_train_loss += loss.item()
             num_batches += 1
 
-            # Simulate different client speeds
             if client_speed < 1.0:
                 time.sleep(0.001 * (1.0 - client_speed))
 
-        avg_train_loss = epoch_train_loss / num_batches
+        avg_train_loss = epoch_train_loss / max(num_batches, 1)
         train_losses.append(avg_train_loss)
 
-        # Validation phase
         model.eval()
         val_loss = 0
         correct = 0
@@ -200,12 +437,11 @@ def train_locally_with_early_stopping(model, train_loader, val_loader, layers_to
                 total += y_val.size(0)
                 correct += (predicted == y_val).sum().item()
 
-        avg_val_loss = val_loss / len(val_loader)
-        val_accuracy = 100 * correct / total
+        avg_val_loss = val_loss / max(len(val_loader), 1)
+        val_accuracy = 100 * correct / max(total, 1)
         val_losses.append(avg_val_loss)
         val_accuracies.append(val_accuracy)
 
-        # Early stopping check
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             patience_counter = 0
@@ -213,13 +449,11 @@ def train_locally_with_early_stopping(model, train_loader, val_loader, layers_to
         else:
             patience_counter += 1
 
-        model.train()  # Back to training mode
+        model.train()
 
-        # Stop early if patience exceeded
         if patience_counter >= patience:
             break
 
-    # Load best model
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
 
@@ -231,13 +465,11 @@ def train_locally_with_early_stopping(model, train_loader, val_loader, layers_to
     return (model.state_dict(), elapsed_time, final_train_loss,
             final_val_accuracy, epochs_trained, train_losses, val_losses, val_accuracies)
 
-# --- 4. Improved Layer depth adaptation for Fashion-MNIST ---
+# =================== DLA IMPLEMENTATION ===================
+
 def adjust_layers_improved(elapsed_time, current_depth, client_id,
-                         T_low=10.0, T_high=30.0, max_layers=5):
-    """
-    Improved layer adjustment with thresholds optimized for Fashion-MNIST
-    """
-    # Client-specific thresholds accounting for Fashion-MNIST complexity
+                         T_low=8.0, T_high=25.0, max_layers=5):
+    """Improved layer adjustment with thresholds optimized for MNIST simplicity"""
     client_T_low = T_low * (0.7 + client_id * 0.1)
     client_T_high = T_high * (0.8 + client_id * 0.2)
 
@@ -248,22 +480,17 @@ def adjust_layers_improved(elapsed_time, current_depth, client_id,
     else:
         return current_depth
 
-# --- 4b. Enhanced Stability tracking for DLA ---
 class DLAStabilityTracker:
-    """
-    Enhanced stability tracking with Fashion-MNIST specific adaptations
-    """
+    """Enhanced DLA stability tracking"""
     def __init__(self, num_clients):
         self.adaptation_history = {cid: [] for cid in range(num_clients)}
         self.consecutive_suggestions = {cid: {'increase': 0, 'decrease': 0, 'stay': 0}
                                       for cid in range(num_clients)}
         self.performance_history = {cid: [] for cid in range(num_clients)}
 
-    def should_adapt(self, client_id, current_depth, suggested_depth, client_performance=None, stability_threshold=3):
-        """
-        Enhanced adaptation decision with performance consideration
-        """
-        # Record performance if provided
+    def should_adapt(self, client_id, current_depth, suggested_depth,
+                    client_performance=None, stability_threshold=3):
+        """Enhanced adaptation decision"""
         if client_performance is not None:
             self.performance_history[client_id].append(client_performance)
 
@@ -271,13 +498,11 @@ class DLAStabilityTracker:
             self.consecutive_suggestions[client_id] = {'increase': 0, 'decrease': 0, 'stay': 0}
             return current_depth
 
-        # Track suggestion type
         if suggested_depth > current_depth:
             self.consecutive_suggestions[client_id]['increase'] += 1
             self.consecutive_suggestions[client_id]['decrease'] = 0
             self.consecutive_suggestions[client_id]['stay'] = 0
 
-            # Only increase if we've had multiple consecutive suggestions
             if self.consecutive_suggestions[client_id]['increase'] >= stability_threshold:
                 self.consecutive_suggestions[client_id]['increase'] = 0
                 return suggested_depth
@@ -287,18 +512,16 @@ class DLAStabilityTracker:
             self.consecutive_suggestions[client_id]['increase'] = 0
             self.consecutive_suggestions[client_id]['stay'] = 0
 
-            # Only decrease if we've had multiple consecutive suggestions
             if self.consecutive_suggestions[client_id]['decrease'] >= stability_threshold:
                 self.consecutive_suggestions[client_id]['decrease'] = 0
                 return suggested_depth
 
         return current_depth
 
-# --- 5. Enhanced Model evaluation ---
+# =================== EVALUATION AND AGGREGATION ===================
+
 def evaluate_model(model, test_loader, device):
-    """
-    Enhanced model evaluation with detailed metrics
-    """
+    """Enhanced model evaluation"""
     model.eval()
     correct = 0
     total = 0
@@ -315,26 +538,21 @@ def evaluate_model(model, test_loader, device):
             total += y.size(0)
             correct += (predicted == y).sum().item()
 
-    accuracy = 100 * correct / total
-    avg_loss = total_loss / len(test_loader)
-    return accuracy, avg_loss
+    accuracy = 100 * correct / max(total, 1)
+    avg_loss = total_loss / max(len(test_loader), 1)
+    return float(accuracy), float(avg_loss)
 
-# --- 6. Weighted Average of Model Weights ---
 def average_weights(weight_list, client_sizes=None):
-    """
-    Weighted average of model weights based on client dataset sizes
-    """
+    """Weighted average of model weights"""
     if client_sizes is None:
         client_sizes = [1] * len(weight_list)
 
     total_size = sum(client_sizes)
     avg_weights = copy.deepcopy(weight_list[0])
 
-    # Initialize with zeros
     for key in avg_weights:
         avg_weights[key] = torch.zeros_like(avg_weights[key])
 
-    # Weighted sum
     for i, weights in enumerate(weight_list):
         weight = client_sizes[i] / total_size
         for key in avg_weights:
@@ -342,62 +560,51 @@ def average_weights(weight_list, client_sizes=None):
 
     return avg_weights
 
-# --- 7. Enhanced Fashion-MNIST federated dataset creation ---
-def create_federated_fashion_mnist(num_clients=50, batch_size=64, iid=True, val_split=0.2):
-    """
-    Create enhanced federated Fashion-MNIST dataset with validation splits
-    """
-    print("Downloading Fashion-MNIST dataset...")
+# =================== FEDERATED DATASET CREATION ===================
 
-    # Fashion-MNIST specific preprocessing
+def create_federated_mnist(num_clients=50, batch_size=64, iid=True, val_split=0.2):
+    """Create research-grade federated MNIST dataset"""
+    print("Downloading MNIST dataset...")
+
     transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize((0.2860,), (0.3530,)),  # Fashion-MNIST specific normalization
-        transforms.Lambda(lambda x: x.view(-1))  # Flatten to 784
+        transforms.Normalize((0.1307,), (0.3081,)),
+        transforms.Lambda(lambda x: x.view(-1))
     ])
 
-    train_dataset = torchvision.datasets.FashionMNIST(
+    train_dataset = torchvision.datasets.MNIST(
         root='./data', train=True, download=True, transform=transform
     )
-    test_dataset = torchvision.datasets.FashionMNIST(
+    test_dataset = torchvision.datasets.MNIST(
         root='./data', train=False, download=True, transform=transform
     )
 
-    # Fashion-MNIST class names
-    fashion_classes = ['T-shirt/top', 'Trouser', 'Pullover', 'Dress', 'Coat',
-                      'Sandal', 'Shirt', 'Sneaker', 'Bag', 'Ankle boot']
-
-    # Create test loader
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    mnist_classes = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9']
 
-    # Enhanced client creation with full dataset utilization
     total_samples = len(train_dataset)
     base_samples_per_client = total_samples // num_clients
 
     clients = []
     client_speeds = []
 
-    print(f"Creating federated Fashion-MNIST data splits for {num_clients} clients...")
+    print(f"Creating {num_clients} federated MNIST clients...")
 
     for client_id in range(num_clients):
-        # More realistic speed distribution for Fashion-MNIST
-        if client_id < num_clients * 0.1:  # 10% slow clients (mobile devices)
+        if client_id < num_clients * 0.1:
             speed_factor = np.random.uniform(0.3, 0.6)
-        elif client_id < num_clients * 0.2:  # 10% fast clients (edge servers)
+        elif client_id < num_clients * 0.2:
             speed_factor = np.random.uniform(1.8, 2.5)
-        else:  # 80% normal clients (laptops/desktops)
+        else:
             speed_factor = np.random.uniform(0.8, 1.4)
 
-        # Fixed sample allocation for consistency
         client_samples = base_samples_per_client
 
         if iid:
-            # IID: random samples from all fashion categories
             indices = np.random.choice(range(total_samples), client_samples, replace=False)
         else:
-            # Non-IID: fashion stores with specialized inventories
-            num_categories_per_client = np.random.randint(3, 7)  # 3-6 fashion categories per client
-            target_classes = np.random.choice(range(10), size=num_categories_per_client, replace=False)
+            num_categories = np.random.randint(2, 5)
+            target_classes = np.random.choice(range(10), size=num_categories, replace=False)
             indices = []
             targets = np.array(train_dataset.targets)
 
@@ -409,11 +616,10 @@ def create_federated_fashion_mnist(num_clients=50, batch_size=64, iid=True, val_
 
             indices = indices[:client_samples]
 
-            if client_id < 5:  # Show first 5 clients for debugging
-                client_fashion_types = [fashion_classes[i] for i in target_classes]
-                print(f"Client {client_id} fashion categories: {client_fashion_types}")
+            if client_id < 5:
+                client_specialization = [mnist_classes[i] for i in target_classes]
+                print(f"Client {client_id} specializes in digits: {client_specialization}")
 
-        # Create train/validation split
         client_dataset = Subset(train_dataset, indices)
         train_size = int((1 - val_split) * len(client_dataset))
         val_size = len(client_dataset) - train_size
@@ -426,61 +632,27 @@ def create_federated_fashion_mnist(num_clients=50, batch_size=64, iid=True, val_
         clients.append((train_loader, val_loader, len(client_dataset)))
         client_speeds.append(speed_factor)
 
-        if client_id < 10 or client_id % 10 == 0:  # Progress indicator
-            print(f"Client {client_id}: {len(client_dataset)} samples, speed {speed_factor:.2f}x")
-
-    print(f"✅ Created {num_clients} Fashion-MNIST clients with {total_samples} total samples")
+    print(f"Created {num_clients} MNIST clients with {total_samples} total samples")
     return clients, test_loader, client_speeds
 
-# --- 8. Global Early Stopping Tracker ---
-class GlobalEarlyStopping:
+# =================== RESEARCH-GRADE FEDERATED TRAINING WITH GLOBAL EARLY STOPPING ===================
+
+def research_grade_federated_training_mnist_with_early_stopping(clients, client_speeds, max_rounds, device, 
+                                                               strategy="fedavg", max_layers=5, fixed_depth=3, 
+                                                               test_loader=None, lr=0.001, max_local_epochs=15):
     """
-    Track global model performance and implement early stopping for Fashion-MNIST
+    Research-grade federated training for MNIST with GLOBAL EARLY STOPPING
     """
-    def __init__(self, patience=18, min_delta=0.1):  # Slightly higher patience for Fashion-MNIST
-        self.patience = patience
-        self.min_delta = min_delta
-        self.best_accuracy = 0
-        self.patience_counter = 0
-        self.should_stop = False
-        self.best_round = 0
+    global_model = MNISTNet().to(device)
 
-    def update(self, current_accuracy, current_round):
-        """
-        Update early stopping status based on current accuracy
-        """
-        if current_accuracy > self.best_accuracy + self.min_delta:
-            self.best_accuracy = current_accuracy
-            self.patience_counter = 0
-            self.best_round = current_round
-        else:
-            self.patience_counter += 1
+    # Initialize research-grade tracking
+    straggler_tracker = ResearchGradeStragglerTracker(len(clients), client_speeds)
+    efficiency_tracker = ResearchGradeEfficiencyTracker(len(clients))
+    
+    # GLOBAL EARLY STOPPING TRACKER
+    convergence_tracker = GlobalConvergenceTracker('MNIST', patience=15, accuracy_plateau=0.1, min_rounds=50)
 
-        if self.patience_counter >= self.patience:
-            self.should_stop = True
-
-        return self.should_stop
-
-# --- 9. Enhanced Fashion-MNIST Federated Training Loop ---
-def federated_training_loop_fashion_mnist(
-    clients,
-    client_speeds,
-    max_rounds,
-    device,
-    strategy="fedavg",
-    max_layers=5,
-    fixed_depth=3,
-    test_loader=None,
-    lr=0.001,
-    max_local_epochs=15,
-    early_stop_patience=18
-):
-    """
-    Enhanced federated training specifically optimized for Fashion-MNIST
-    """
-    global_model = FashionMNISTNet().to(device)
-
-    # Enhanced metrics tracking
+    # Comprehensive results tracking
     results = {
         'test_accuracies': [],
         'test_losses': [],
@@ -490,23 +662,35 @@ def federated_training_loop_fashion_mnist(
         'client_val_accuracies': defaultdict(list),
         'round_times': [],
         'losses': defaultdict(list),
-        'convergence_info': {}
+        'convergence_info': {},
+        'stragglers_per_round': [],
+        'client_straggler_history': defaultdict(list),
+        'straggler_statistics': {},
+        'participation_analysis': [],
+        'flops_per_round': [],
+        'communication_costs_per_round': [],
+        'energy_consumption_per_round': [],
+        'computational_efficiency': [],
+        'communication_efficiency': [],
+        'client_communication_breakdown': defaultdict(list),
+        # CONVERGENCE TRACKING
+        'rounds_to_convergence': None,
+        'flops_until_convergence': 0,
+        'communication_until_convergence': 0,
+        'energy_until_convergence': 0,
+        'accuracy_at_convergence': None,
+        'early_stopped': False
     }
 
-    # Initialize components
-    current_depths = {cid: 3 for cid in range(len(clients))}  # Start at depth 3 for Fashion-MNIST
+    # Initialize DLA components
+    current_depths = {cid: 3 for cid in range(len(clients))}
     dla_tracker = DLAStabilityTracker(len(clients)) if strategy == "dla" else None
-    global_early_stopping = GlobalEarlyStopping(patience=early_stop_patience)
 
-    print(f"\n🚀 Starting Enhanced Fashion-MNIST Federated Training")
-    print(f"🔄 Strategy: {strategy.upper()}")
-    print(f"👥 Clients: {len(clients)}")
-    print(f"🔄 Max Rounds: {max_rounds}")
-    print(f"🏋️ Max Layers: {max_layers}")
-    print(f"📚 Max Local Epochs: {max_local_epochs}")
-    print(f"⏰ Early Stop Patience: {early_stop_patience}")
-    print(f"💻 Device: {device}")
-    print(f"🏃 Client speeds: min={min(client_speeds):.2f}x, max={max(client_speeds):.2f}x, avg={np.mean(client_speeds):.2f}x")
+    print(f"\nRESEARCH-GRADE MNIST FEDERATED LEARNING WITH GLOBAL EARLY STOPPING")
+    print(f"Strategy: {strategy.upper()}")
+    print(f"Clients: {len(clients)}")
+    print(f"Max Rounds: {max_rounds} | Early Stop Threshold: 95.0% | Patience: 15 rounds")
+    print(f"Comprehensive Tracking: Enabled")
     print("-" * 80)
 
     for r in range(max_rounds):
@@ -515,13 +699,12 @@ def federated_training_loop_fashion_mnist(
 
         local_weights = []
         local_sizes = []
-        round_stats = {
-            'total_epochs': 0,
-            'early_stops': 0,
-            'avg_val_accuracy': 0,
-            'depth_changes': 0
-        }
+        round_training_times = []
+        round_flops = []
+        round_comm_costs = []
+        round_energy = []
 
+        # Process each client
         for cid, (train_loader, val_loader, dataset_size) in enumerate(clients):
             # Determine layer depth based on strategy
             if strategy == "fedavg":
@@ -535,11 +718,13 @@ def federated_training_loop_fashion_mnist(
             else:
                 raise ValueError(f"Unknown strategy: {strategy}")
 
-            # Record depth
             results['client_depths'][cid].append(layer_depth)
 
-            # Enhanced local training with early stopping
-            training_results = train_locally_with_early_stopping(
+            # Start comprehensive monitoring
+            start_metrics = efficiency_tracker.start_client_monitoring(cid)
+
+            # Local training
+            training_results = train_locally_with_monitoring(
                 global_model, train_loader, val_loader, layer_depth, device,
                 client_speed=client_speeds[cid], max_epochs=max_local_epochs, lr=lr, patience=5
             )
@@ -547,299 +732,388 @@ def federated_training_loop_fashion_mnist(
             (local_state_dict, elapsed_time, final_train_loss,
              final_val_accuracy, epochs_trained, train_losses, val_losses, val_accuracies) = training_results
 
+            # End comprehensive monitoring
+            efficiency_metrics = efficiency_tracker.end_client_monitoring(
+                cid, start_metrics, local_state_dict, layer_depth, strategy
+            )
+
             # Record comprehensive metrics
             results['training_times'][cid].append(elapsed_time)
             results['losses'][cid].append(final_train_loss)
             results['client_epochs_trained'][cid].append(epochs_trained)
             results['client_val_accuracies'][cid].append(final_val_accuracy)
+            results['client_communication_breakdown'][cid].append(efficiency_metrics['communication_cost'])
 
-            # Update round statistics
-            round_stats['total_epochs'] += epochs_trained
-            round_stats['avg_val_accuracy'] += final_val_accuracy
-            if epochs_trained < max_local_epochs:
-                round_stats['early_stops'] += 1
+            round_training_times.append(elapsed_time)
+            round_flops.append(efficiency_metrics['flops'])
+            round_comm_costs.append(efficiency_metrics['communication_cost']['total_bytes'])
+            round_energy.append(efficiency_metrics['energy'])
 
-            # Show progress for first few clients and every 10th client
-            if cid < 5 or cid % 10 == 0:
-                print(f"Client {cid:2d}: depth={layer_depth}, epochs={epochs_trained:2d}/{max_local_epochs}, "
-                      f"time={elapsed_time:5.1f}s, val_acc={final_val_accuracy:5.1f}%, loss={final_train_loss:.4f}")
+            # Show detailed progress for first few clients
+            if cid < 3:
+                comm = efficiency_metrics['communication_cost']
+                print(f"Client {cid:2d}: depth={layer_depth}, time={elapsed_time:5.1f}s, "
+                      f"FLOPs={efficiency_metrics['flops']/1e6:.1f}M, "
+                      f"Comm={comm['total_bytes']/1024:.1f}KB "
+                      f"(↓{comm['downstream_bytes']/1024:.1f}KB + ↑{comm['upstream_bytes']/1024:.1f}KB), "
+                      f"Energy={efficiency_metrics['energy']:.1f}J")
 
-            # Update depth for DLA strategy
+            # DLA depth adaptation (MNIST-specific thresholds)
             if strategy == "dla":
                 suggested_depth = adjust_layers_improved(elapsed_time, layer_depth, cid,
-                                                       T_low=10.0, T_high=30.0, max_layers=max_layers)
-
+                                                       T_low=8.0, T_high=25.0, max_layers=max_layers)
                 new_depth = dla_tracker.should_adapt(cid, layer_depth, suggested_depth,
                                                     client_performance=final_val_accuracy, stability_threshold=3)
                 current_depths[cid] = new_depth
 
-                if new_depth != layer_depth:
-                    if cid < 5:  # Only show first 5 for clarity
-                        print(f"  → Client {cid} depth adapted: {layer_depth} → {new_depth}")
-                    round_stats['depth_changes'] += 1
-
-            # Collect weights and sizes for aggregation
             local_weights.append(local_state_dict)
             local_sizes.append(dataset_size)
 
-        # Aggregate weights
+        # COMPREHENSIVE STRAGGLER AND PARTICIPATION ANALYSIS
+        round_stragglers, straggler_count, participation_analysis = straggler_tracker.identify_round_stragglers_with_participation(
+            round_training_times, r
+        )
+
+        # Record round-level comprehensive metrics
+        results['stragglers_per_round'].append(straggler_count)
+        results['participation_analysis'].append(participation_analysis)
+        results['flops_per_round'].append(int(np.sum(round_flops)))
+        results['communication_costs_per_round'].append(int(np.sum(round_comm_costs)))
+        results['energy_consumption_per_round'].append(float(np.sum(round_energy)))
+
+        # Calculate efficiency metrics
+        if results['test_accuracies']:
+            prev_acc = results['test_accuracies'][-1]
+        else:
+            prev_acc = 0
+
+        current_flops = np.sum(round_flops)
+        current_comm = np.sum(round_comm_costs)
+
+        comp_efficiency = prev_acc / max(current_flops / 1e9, 1e-10)
+        comm_efficiency = prev_acc / max(current_comm / 1e6, 1e-10)
+
+        results['computational_efficiency'].append(comp_efficiency)
+        results['communication_efficiency'].append(comm_efficiency)
+
+        for cid, is_straggler in enumerate(round_stragglers):
+            results['client_straggler_history'][cid].append(is_straggler)
+
+        # Comprehensive round summary
+        straggler_ids = [cid for cid, is_straggler in enumerate(round_stragglers) if is_straggler]
+        median_time = float(np.median(round_training_times))
+        avg_flops = float(np.mean(round_flops)) / 1e6
+        total_comm = float(np.sum(round_comm_costs)) / 1024
+        total_energy = float(np.sum(round_energy))
+
+        print(f"\nRound {r+1} MNIST Research-Grade Analysis:")
+        print(f"   Median Training Time: {median_time:.1f}s")
+        print(f"   Stragglers: {straggler_count}/{len(clients)} ({straggler_count/len(clients)*100:.1f}%)")
+        print(f"   Slow Device Inclusion: {participation_analysis['slow_inclusion_rate']*100:.1f}%")
+        print(f"   Accommodation Success: {participation_analysis['accommodation_efficiency']*100:.1f}%")
+        print(f"   Total MLP FLOPs: {avg_flops*len(clients):.1f}M")
+        print(f"   Total Communication: {total_comm:.1f}KB")
+        print(f"   Total Energy: {total_energy:.1f}J")
+        if straggler_ids:
+            print(f"   Straggler IDs: {straggler_ids[:5]}{'...' if len(straggler_ids) > 5 else ''}")
+
+        # Federated aggregation
         global_weights = average_weights(local_weights, local_sizes)
         global_model.load_state_dict(global_weights)
 
-        # Evaluate global model
+        # Global model evaluation
         if test_loader:
             test_acc, test_loss = evaluate_model(global_model, test_loader, device)
             results['test_accuracies'].append(test_acc)
             results['test_losses'].append(test_loss)
 
-            # Update round statistics
-            round_stats['avg_val_accuracy'] /= len(clients)
+            print(f"   Global Test Accuracy: {test_acc:.2f}%")
+            if current_flops > 0:
+                efficiency_score = test_acc / max(avg_flops, 1e-10)
+                print(f"   MLP Efficiency: {efficiency_score:.2f} acc/MFLOP")
 
-            print(f"\n📊 Round {r+1} Summary:")
-            print(f"   Global Test Accuracy: {test_acc:.2f}% | Test Loss: {test_loss:.4f}")
-            print(f"   Avg Client Val Acc: {round_stats['avg_val_accuracy']:.2f}%")
-            print(f"   Total Epochs Trained: {round_stats['total_epochs']}")
-            print(f"   Early Stops: {round_stats['early_stops']}/{len(clients)}")
-            if strategy == "dla":
-                print(f"   Depth Changes: {round_stats['depth_changes']}")
+            # CHECK FOR GLOBAL CONVERGENCE
+            converged = convergence_tracker.update_accuracy(test_acc, r + 1)
+            if converged:
+                print(f"   *** GLOBAL CONVERGENCE DETECTED at Round {r+1} ***")
+                print(f"   *** Accuracy: {test_acc:.2f}% >= Threshold: {convergence_tracker.min_accuracy}% ***")
+                print(f"   *** Stopping early to save resources ***")
+                
+                # Record convergence metrics
+                results['rounds_to_convergence'] = r + 1
+                results['flops_until_convergence'] = int(np.sum(results['flops_per_round']))
+                results['communication_until_convergence'] = int(np.sum(results['communication_costs_per_round']))
+                results['energy_until_convergence'] = float(np.sum(results['energy_consumption_per_round']))
+                results['accuracy_at_convergence'] = test_acc
+                results['early_stopped'] = True
+                break
 
         round_time = time.time() - round_start_time
         results['round_times'].append(round_time)
-        print(f"   Round Time: {round_time:.1f}s")
 
-        # Check global early stopping
-        if test_loader and global_early_stopping.update(test_acc, r):
-            print(f"\n🛑 Global Early Stopping triggered at round {r+1}")
-            print(f"   Best accuracy: {global_early_stopping.best_accuracy:.2f}% at round {global_early_stopping.best_round+1}")
-            results['convergence_info'] = {
-                'stopped_early': True,
-                'stopped_at_round': r + 1,
-                'best_accuracy': global_early_stopping.best_accuracy,
-                'best_round': global_early_stopping.best_round + 1
-            }
-            break
-    else:
-        # Training completed without early stopping
-        results['convergence_info'] = {
-            'stopped_early': False,
-            'completed_rounds': max_rounds,
-            'final_accuracy': results['test_accuracies'][-1] if results['test_accuracies'] else 0
+        # Progress indicator every 25 rounds
+        if (r + 1) % 25 == 0:
+            print(f"\nProgress: {r+1}/{max_rounds} rounds completed")
+            if results['test_accuracies']:
+                current_acc = results['test_accuracies'][-1]
+                print(f"   Current MNIST Accuracy: {current_acc:.2f}%")
+                print(f"   Target for Early Stop: {convergence_tracker.min_accuracy}%")
+
+    # Final comprehensive statistics
+    convergence_info = convergence_tracker.get_convergence_info()
+    results['convergence_info'] = convergence_info
+    
+    if not convergence_info['converged']:
+        print(f"\n*** No convergence achieved within {max_rounds} rounds ***")
+        results['rounds_to_convergence'] = max_rounds
+        results['flops_until_convergence'] = int(np.sum(results['flops_per_round']))
+        results['communication_until_convergence'] = int(np.sum(results['communication_costs_per_round']))
+        results['energy_until_convergence'] = float(np.sum(results['energy_consumption_per_round']))
+        results['accuracy_at_convergence'] = results['test_accuracies'][-1] if results['test_accuracies'] else 0.0
+        results['early_stopped'] = False
+
+    results['straggler_statistics'] = straggler_tracker.get_comprehensive_straggler_statistics()
+
+    return global_model, results, straggler_tracker, efficiency_tracker
+
+# =================== RESEARCH-GRADE ANALYSIS FUNCTIONS ===================
+
+def analyze_comprehensive_research_performance_mnist_early_stop(all_results, strategies, straggler_trackers, efficiency_trackers):
+    """Research-grade comprehensive analysis for MNIST MLP federated learning with early stopping"""
+    print(f"\n{'='*80}")
+    print("RESEARCH-GRADE MNIST MLP PERFORMANCE ANALYSIS WITH GLOBAL EARLY STOPPING")
+    print("Digit Recognition Federated Learning with Convergence Efficiency")
+    print(f"{'='*80}")
+
+    analysis_summary = {}
+
+    for i, strategy in enumerate(strategies):
+        results = all_results[i]
+        straggler_stats = results.get('straggler_statistics', {})
+
+        if not results.get('test_accuracies'):
+            continue
+
+        # Core Performance Metrics
+        final_accuracy = float(results['test_accuracies'][-1])
+        convergence_info = results.get('convergence_info', {})
+        rounds_to_convergence = results.get('rounds_to_convergence', len(results['test_accuracies']))
+        early_stopped = results.get('early_stopped', False)
+        
+        # Efficiency metrics until convergence
+        flops_until_convergence = results.get('flops_until_convergence', 0)
+        comm_until_convergence = results.get('communication_until_convergence', 0)
+        energy_until_convergence = results.get('energy_until_convergence', 0.0)
+        
+        # Time efficiency
+        total_time = float(np.sum(results.get('round_times', [])[:rounds_to_convergence]))
+
+        # Research-Grade Straggler Metrics
+        stragglers_until_convergence = int(np.sum(results.get('stragglers_per_round', [])[:rounds_to_convergence]))
+        straggler_rate = straggler_stats.get('straggler_rate', 0)
+        accommodation_efficiency = straggler_stats.get('avg_accommodation_efficiency', 0)
+        slow_inclusion_rate = straggler_stats.get('avg_slow_inclusion_rate', 0)
+
+        # Calculate convergence efficiency ratios
+        convergence_computational_efficiency = final_accuracy / max(flops_until_convergence / 1e9, 1e-10)
+        convergence_communication_efficiency = final_accuracy / max(comm_until_convergence / 1e6, 1e-10)
+        convergence_energy_efficiency = final_accuracy / max(energy_until_convergence, 1e-10)
+        convergence_time_efficiency = final_accuracy / max(total_time, 1e-10)
+
+        analysis_summary[strategy] = {
+            'final_accuracy': final_accuracy,
+            'rounds_to_convergence': rounds_to_convergence,
+            'early_stopped': early_stopped,
+            'convergence_time': total_time,
+            'flops_until_convergence': flops_until_convergence,
+            'communication_until_convergence': comm_until_convergence,
+            'energy_until_convergence': energy_until_convergence,
+            'stragglers_until_convergence': stragglers_until_convergence,
+            'straggler_rate': straggler_rate,
+            'accommodation_efficiency': accommodation_efficiency,
+            'slow_inclusion_rate': slow_inclusion_rate,
+            'convergence_computational_efficiency': convergence_computational_efficiency,
+            'convergence_communication_efficiency': convergence_communication_efficiency,
+            'convergence_energy_efficiency': convergence_energy_efficiency,
+            'convergence_time_efficiency': convergence_time_efficiency
         }
 
-    return global_model, results
+        convergence_status = "CONVERGED EARLY" if early_stopped else "NO CONVERGENCE"
+        
+        print(f"\n{strategy.upper()} - MLP Convergence Analysis:")
+        print(f"   Final Accuracy: {final_accuracy:.2f}%")
+        print(f"   Convergence Status: {convergence_status}")
+        print(f"   Rounds to Convergence: {rounds_to_convergence}")
+        print(f"   Time to Convergence: {total_time:.1f}s ({total_time/60:.1f} min)")
+        print(f"   FLOPs until Convergence: {flops_until_convergence/1e9:.2f} GFLOP")
+        print(f"   Communication until Convergence: {comm_until_convergence/1e6:.2f} MB")
+        print(f"   Energy until Convergence: {energy_until_convergence:.1f} J")
+        print(f"   Stragglers until Convergence: {stragglers_until_convergence}")
+        print(f"   Slow Device Inclusion: {slow_inclusion_rate*100:.1f}%")
+        print(f"   CONVERGENCE Computational Efficiency: {convergence_computational_efficiency:.4f} acc/GFLOP")
+        print(f"   CONVERGENCE Communication Efficiency: {convergence_communication_efficiency:.4f} acc/MB")
+        print(f"   CONVERGENCE Time Efficiency: {convergence_time_efficiency:.4f} acc/s")
 
-# --- 10. Enhanced Fashion-MNIST Plotting Functions ---
-def plot_fashion_mnist_comprehensive_results(all_results, strategies):
-    """
-    Comprehensive visualization specifically for Fashion-MNIST results
-    """
-    fig, axes = plt.subplots(2, 3, figsize=(20, 12))
+    return analysis_summary
+
+def plot_convergence_analysis_mnist(all_results, strategies):
+    """Research-grade convergence visualization for MNIST"""
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    fig.suptitle('MNIST MLP Federated Learning - Global Early Stopping Analysis\n(Convergence Efficiency Comparison)',
+                 fontsize=16, fontweight='bold')
 
     colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']
-    markers = ['o', 's', '^', 'D']
-    linestyles = ['-', '--', '-.', ':']
+    line_styles = ['-', '--', '-.', ':']
 
-    # 1. Test Accuracy Evolution
-    axes[0, 0].set_title('Fashion-MNIST Test Accuracy Over Rounds', fontsize=14, fontweight='bold')
+    # 1. Accuracy Evolution with Convergence Points
+    axes[0, 0].set_title('MNIST Accuracy Evolution\n(Early Stopping Points)', fontsize=12, fontweight='bold')
     for i, (strategy, results) in enumerate(zip(strategies, all_results)):
         if results['test_accuracies']:
             rounds = range(1, len(results['test_accuracies'])+1)
             axes[0, 0].plot(rounds, results['test_accuracies'],
-                           marker=markers[i], label=strategy.upper(), color=colors[i],
-                           linestyle=linestyles[i], linewidth=2.5, markersize=6,
-                           markerfacecolor='white', markeredgewidth=2, markeredgecolor=colors[i])
-
+                           label=f'{strategy.upper()}', color=colors[i],
+                           linewidth=2.5, linestyle=line_styles[i])
+            
+            # Mark convergence point
+            if results.get('early_stopped', False):
+                conv_round = results.get('rounds_to_convergence', len(results['test_accuracies']))
+                conv_acc = results['test_accuracies'][conv_round-1] if conv_round <= len(results['test_accuracies']) else results['test_accuracies'][-1]
+                axes[0, 0].scatter(conv_round, conv_acc, color=colors[i], s=100, marker='*', edgecolor='black', linewidth=1)
+                
+    # Add convergence threshold line
+    axes[0, 0].axhline(y=95.0, color='red', linestyle='--', alpha=0.7, label='Convergence Threshold (95%)')
     axes[0, 0].set_xlabel('Round')
     axes[0, 0].set_ylabel('Test Accuracy (%)')
     axes[0, 0].legend()
     axes[0, 0].grid(True, alpha=0.3)
-    axes[0, 0].set_facecolor('#fafafa')
 
-    # 2. Training Time Comparison
-    axes[0, 1].set_title('Average Training Time per Round', fontsize=14, fontweight='bold')
-    avg_times = []
+    # 2. Rounds to Convergence Comparison
+    axes[0, 1].set_title('Rounds to Convergence\n(Efficiency Metric)', fontsize=12, fontweight='bold')
+    conv_rounds = []
+    strategy_names = []
+    colors_used = []
     for i, (strategy, results) in enumerate(zip(strategies, all_results)):
-        if results['round_times']:
-            avg_time = np.mean(results['round_times'])
-            avg_times.append(avg_time)
-            bar = axes[0, 1].bar(strategy.upper(), avg_time, color=colors[i], alpha=0.8, edgecolor='black')
-            axes[0, 1].text(i, avg_time + max(avg_times)*0.01, f'{avg_time:.1f}s',
-                           ha='center', va='bottom', fontweight='bold')
+        rounds = results.get('rounds_to_convergence', 200)
+        conv_rounds.append(rounds)
+        strategy_names.append(strategy.upper())
+        colors_used.append(colors[i])
 
-    axes[0, 1].set_ylabel('Time (seconds)')
-    axes[0, 1].set_facecolor('#fafafa')
-    axes[0, 1].grid(True, alpha=0.3, axis='y')
+    bars = axes[0, 1].bar(strategy_names, conv_rounds, color=colors_used, alpha=0.8)
+    axes[0, 1].set_ylabel('Rounds to Convergence')
+    for bar, val, result in zip(bars, conv_rounds, all_results):
+        label = f'{val}' if result.get('early_stopped', False) else f'{val}*'
+        axes[0, 1].text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(conv_rounds)*0.01,
+                       label, ha='center', va='bottom', fontweight='bold')
 
-    # 3. Convergence Analysis
-    axes[0, 2].set_title('Convergence Information', fontsize=14, fontweight='bold')
-    convergence_data = []
+    # 3. Convergence Communication Efficiency
+    axes[0, 2].set_title('Communication Efficiency\n(Until Convergence)', fontsize=12, fontweight='bold')
+    comm_eff = []
     for strategy, results in zip(strategies, all_results):
-        conv_info = results.get('convergence_info', {})
-        if conv_info.get('stopped_early', False):
-            convergence_data.append(f"{strategy.upper()}: Early stop at round {conv_info['stopped_at_round']}")
-        else:
-            convergence_data.append(f"{strategy.upper()}: Completed {conv_info.get('completed_rounds', 'N/A')} rounds")
+        final_acc = results['test_accuracies'][-1] if results['test_accuracies'] else 0
+        total_comm = results.get('communication_until_convergence', 1)
+        eff = final_acc / max(total_comm / 1e6, 1e-10)
+        comm_eff.append(eff)
 
-    axes[0, 2].text(0.1, 0.9, '\n'.join(convergence_data), transform=axes[0, 2].transAxes,
-                   fontsize=10, verticalalignment='top', bbox=dict(boxstyle="round,pad=0.3", facecolor='lightblue'))
-    axes[0, 2].set_xlim(0, 1)
-    axes[0, 2].set_ylim(0, 1)
-    axes[0, 2].axis('off')
+    bars = axes[0, 2].bar(strategy_names, comm_eff, color=colors_used, alpha=0.8)
+    axes[0, 2].set_ylabel('Accuracy / MB (until convergence)')
+    for bar, val in zip(bars, comm_eff):
+        axes[0, 2].text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(comm_eff)*0.01,
+                       f'{val:.4f}', ha='center', va='bottom', fontweight='bold')
 
-    # 4. Layer Depth Evolution (DLA)
-    axes[1, 0].set_title('Layer Depth Evolution (DLA)', fontsize=14, fontweight='bold')
-    dla_colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FECA57']
-
+    # 4. Convergence Computational Efficiency
+    axes[1, 0].set_title('Computational Efficiency\n(Until Convergence)', fontsize=12, fontweight='bold')
+    comp_eff = []
     for strategy, results in zip(strategies, all_results):
-        if strategy == "dla" and results['client_depths']:
-            # Show first 5 clients for clarity
-            for cid in range(min(5, len(results['client_depths']))):
-                depths = results['client_depths'][cid]
-                if depths:
-                    axes[1, 0].plot(range(1, len(depths)+1), depths,
-                                   marker='s', label=f'Client {cid}', color=dla_colors[cid],
-                                   linewidth=2, markersize=6, markerfacecolor='white', markeredgewidth=2)
+        final_acc = results['test_accuracies'][-1] if results['test_accuracies'] else 0
+        total_flops = results.get('flops_until_convergence', 1)
+        eff = final_acc / max(total_flops / 1e9, 1e-10)
+        comp_eff.append(eff)
 
-    axes[1, 0].set_xlabel('Round')
-    axes[1, 0].set_ylabel('Layer Depth')
-    axes[1, 0].legend()
-    axes[1, 0].grid(True, alpha=0.3)
-    axes[1, 0].set_facecolor('#fafafa')
+    bars = axes[1, 0].bar(strategy_names, comp_eff, color=colors_used, alpha=0.8)
+    axes[1, 0].set_ylabel('Accuracy / GFLOP (until convergence)')
+    for bar, val in zip(bars, comp_eff):
+        axes[1, 0].text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(comp_eff)*0.01,
+                       f'{val:.4f}', ha='center', va='bottom', fontweight='bold')
 
-    # 5. Training Efficiency
-    axes[1, 1].set_title('Training Efficiency Analysis', fontsize=14, fontweight='bold')
-    efficiency_data = []
-    for i, (strategy, results) in enumerate(zip(strategies, all_results)):
-        if results['test_accuracies'] and results['round_times']:
-            final_accuracy = results['test_accuracies'][-1]
-            total_time = sum(results['round_times'])
-            efficiency = final_accuracy / (total_time / 60)  # Accuracy per minute
-            efficiency_data.append(efficiency)
+    # 5. Energy Efficiency Until Convergence
+    axes[1, 1].set_title('Energy Efficiency\n(Until Convergence)', fontsize=12, fontweight='bold')
+    energy_eff = []
+    for strategy, results in zip(strategies, all_results):
+        final_acc = results['test_accuracies'][-1] if results['test_accuracies'] else 0
+        total_energy = results.get('energy_until_convergence', 1)
+        eff = final_acc / max(total_energy, 1e-10)
+        energy_eff.append(eff)
 
-            bar = axes[1, 1].bar(strategy.upper(), efficiency, color=colors[i], alpha=0.8, edgecolor='black')
-            axes[1, 1].text(i, efficiency + max(efficiency_data)*0.01, f'{efficiency:.1f}',
-                           ha='center', va='bottom', fontweight='bold')
+    bars = axes[1, 1].bar(strategy_names, energy_eff, color=colors_used, alpha=0.8)
+    axes[1, 1].set_ylabel('Accuracy / Joule (until convergence)')
+    for bar, val in zip(bars, energy_eff):
+        axes[1, 1].text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(energy_eff)*0.01,
+                       f'{val:.4f}', ha='center', va='bottom', fontweight='bold')
 
-    axes[1, 1].set_ylabel('Accuracy per Minute')
-    axes[1, 1].set_facecolor('#fafafa')
-    axes[1, 1].grid(True, alpha=0.3, axis='y')
-
-    # 6. Final Performance Summary
-    axes[1, 2].set_title('Final Performance Summary', fontsize=14, fontweight='bold')
+    # 6. Convergence Summary Table
+    axes[1, 2].set_title('MNIST Convergence Summary', fontsize=12, fontweight='bold')
     summary_text = []
     for strategy, results in zip(strategies, all_results):
         if results['test_accuracies']:
             final_acc = results['test_accuracies'][-1]
-            best_acc = max(results['test_accuracies'])
-            total_time = sum(results['round_times']) if results['round_times'] else 0
-
-            # Calculate average epochs per client
-            avg_epochs = 0
-            if results['client_epochs_trained']:
-                all_epochs = [epoch for client_epochs in results['client_epochs_trained'].values()
-                             for epoch in client_epochs]
-                avg_epochs = np.mean(all_epochs) if all_epochs else 0
-
+            rounds = results.get('rounds_to_convergence', 200)
+            early_stop = "✓" if results.get('early_stopped', False) else "✗"
+            
             summary_text.append(
                 f"{strategy.upper()}:\n"
-                f"  Final: {final_acc:.1f}%\n"
-                f"  Best: {best_acc:.1f}%\n"
-                f"  Time: {total_time:.0f}s\n"
-                f"  Avg Epochs: {avg_epochs:.1f}\n"
+                f"  Accuracy: {final_acc:.1f}%\n"
+                f"  Rounds: {rounds}\n"
+                f"  Early Stop: {early_stop}\n"
             )
 
     axes[1, 2].text(0.05, 0.95, '\n'.join(summary_text), transform=axes[1, 2].transAxes,
-                   fontsize=9, verticalalignment='top', fontfamily='monospace',
-                   bbox=dict(boxstyle="round,pad=0.3", facecolor='lightgreen', alpha=0.7))
+                   fontsize=10, verticalalignment='top', fontfamily='monospace',
+                   bbox=dict(boxstyle="round,pad=0.3", facecolor='lightblue', alpha=0.7))
     axes[1, 2].set_xlim(0, 1)
     axes[1, 2].set_ylim(0, 1)
     axes[1, 2].axis('off')
 
     plt.tight_layout()
-    plt.show("comprehensive_results")
+    plt.show("mnist_convergence_analysis")
 
-def plot_fashion_mnist_accuracy_only(all_results, strategies):
-    """
-    High-visibility accuracy plot specifically for Fashion-MNIST
-    """
-    plt.figure(figsize=(14, 8))
+# =================== MAIN RESEARCH EXPERIMENT ===================
 
-    colors = ['#000080', '#FF8C00', '#228B22', '#DC143C']
-    markers = ['o', 's', '^', 'D']
-    linestyles = ['-', '--', '-.', ':']
-
-    for i, (strategy, results) in enumerate(zip(strategies, all_results)):
-        if results['test_accuracies']:
-            rounds = range(1, len(results['test_accuracies'])+1)
-            plt.plot(rounds, results['test_accuracies'],
-                    marker=markers[i], label=f'{strategy.upper()}', color=colors[i],
-                    linestyle=linestyles[i], linewidth=4, markersize=8,
-                    markerfacecolor='white', markeredgewidth=3, markeredgecolor=colors[i])
-
-    plt.title('Fashion-MNIST Test Accuracy: Enhanced Federated Learning\n(50 Clients, 15 Epochs, Research-Grade)',
-             fontsize=16, fontweight='bold', pad=20)
-    plt.xlabel('Round', fontsize=14)
-    plt.ylabel('Test Accuracy (%)', fontsize=14)
-    plt.legend(fontsize=12, framealpha=0.95, fancybox=True, shadow=True)
-    plt.grid(True, alpha=0.4, linestyle='-', linewidth=0.5)
-    plt.gca().set_facecolor('#f8f9fa')
-
-    # Add annotations for final points
-    for i, (strategy, results) in enumerate(zip(strategies, all_results)):
-        if results['test_accuracies']:
-            final_acc = results['test_accuracies'][-1]
-            plt.annotate(f'{final_acc:.1f}%',
-                        xy=(len(results['test_accuracies']), final_acc),
-                        xytext=(10, 5), textcoords='offset points',
-                        fontsize=11, fontweight='bold',
-                        bbox=dict(boxstyle='round,pad=0.3', facecolor=colors[i], alpha=0.7),
-                        color='white')
-
-    plt.tight_layout()
-    plt.show("accuracy_only")
-
-# --- 11. Main Fashion-MNIST Execution Function ---
-def run_fashion_mnist_federated_experiment(iid=True, num_rounds=100,
-                                         num_clients=50, max_local_epochs=15, early_stop_patience=18):
-    """
-    Run enhanced Fashion-MNIST federated learning experiment with comprehensive monitoring
-    """
+def run_research_grade_mnist_experiment_early_stop(iid=True, num_rounds=300,
+                                                   num_clients=50, max_local_epochs=15):
+    """Run research-grade MNIST MLP experiment with global early stopping"""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"🖥️  Using device: {device}")
+    print(f"Using device: {device}")
 
-    # Create enhanced federated Fashion-MNIST dataset
+    # Create federated MNIST dataset
     data_type = "IID" if iid else "Non-IID"
-    print(f"👗 Creating federated Fashion-MNIST dataset ({data_type})...")
-    clients, test_loader, client_speeds = create_federated_fashion_mnist(
-        num_clients=num_clients,
-        batch_size=64,
-        iid=iid,
-        val_split=0.2
+    print(f"Creating federated MNIST dataset ({data_type})...")
+    clients, test_loader, client_speeds = create_federated_mnist(
+        num_clients=num_clients, batch_size=64, iid=iid, val_split=0.2
     )
 
     strategies = ["fedavg", "fedpmt", "feddrop", "dla"]
     all_results = []
+    all_straggler_trackers = []
+    all_efficiency_trackers = []
 
     print(f"\n{'='*80}")
-    print(f"👗 ENHANCED FASHION-MNIST FEDERATED LEARNING EXPERIMENT")
-    print(f"📊 Dataset: Fashion-MNIST ({data_type})")
-    print(f"👥 Clients: {num_clients}")
-    print(f"🔄 Max Rounds: {num_rounds}")
-    print(f"📚 Max Local Epochs: {max_local_epochs}")
-    print(f"⏰ Early Stop Patience: {early_stop_patience}")
-    print(f"🎨 Fashion Categories: T-shirt, Trouser, Pullover, Dress, Coat, Sandal, Shirt, Sneaker, Bag, Ankle boot")
+    print(f"RESEARCH-GRADE MNIST MLP FEDERATED LEARNING WITH GLOBAL EARLY STOPPING")
+    print(f"Best Practices: Convergence Detection, Efficiency-to-Convergence Analysis")
+    print(f"Max Rounds: {num_rounds} | Early Stop: 95.0% accuracy threshold")
+    print(f"Dataset: MNIST (10 digit classes, 28x28 grayscale images)")
+    print(f"Architecture: 4-layer MLP (784-512-256-128-64-10)")
     print(f"{'='*80}")
 
     # Run experiments for each strategy
     for strategy in strategies:
         print(f"\n{'='*80}")
-        print(f"🔄 Running {strategy.upper()} Strategy on Fashion-MNIST")
+        print(f"Running {strategy.upper()} - MLP with Global Early Stopping")
         print(f"{'='*80}")
 
         set_seed(42)  # Reset seed for fair comparison
 
         start_time = time.time()
-        global_model, results = federated_training_loop_fashion_mnist(
+        global_model, results, straggler_tracker, efficiency_tracker = research_grade_federated_training_mnist_with_early_stopping(
             clients=clients,
             client_speeds=client_speeds,
             max_rounds=num_rounds,
@@ -849,175 +1123,144 @@ def run_fashion_mnist_federated_experiment(iid=True, num_rounds=100,
             fixed_depth=3,
             test_loader=test_loader,
             lr=0.001,
-            max_local_epochs=max_local_epochs,
-            early_stop_patience=early_stop_patience
+            max_local_epochs=max_local_epochs
         )
 
         experiment_time = time.time() - start_time
         all_results.append(results)
+        all_straggler_trackers.append(straggler_tracker)
+        all_efficiency_trackers.append(efficiency_tracker)
 
-        # Print comprehensive summary
+        # Convergence summary
         if results['test_accuracies']:
             final_acc = results['test_accuracies'][-1]
-            best_acc = max(results['test_accuracies'])
-            total_training_time = sum(results['round_times'])
+            rounds_to_conv = results.get('rounds_to_convergence', num_rounds)
+            early_stopped = results.get('early_stopped', False)
+            conv_status = "CONVERGED EARLY" if early_stopped else "NO CONVERGENCE"
 
-            # Calculate average client metrics
-            avg_epochs_per_round = 0
-            total_early_stops = 0
-            if results['client_epochs_trained']:
-                all_epochs = []
-                for round_epochs in zip(*results['client_epochs_trained'].values()):
-                    all_epochs.extend(round_epochs)
-                avg_epochs_per_round = np.mean(all_epochs) if all_epochs else 0
-                total_early_stops = sum(1 for epochs in all_epochs if epochs < max_local_epochs)
+            print(f"\n{strategy.upper()} CONVERGENCE RESULTS:")
+            print(f"   Final Accuracy: {final_acc:.2f}%")
+            print(f"   Convergence Status: {conv_status}")
+            print(f"   Rounds to Convergence: {rounds_to_conv}")
+            print(f"   Experiment Time: {experiment_time/60:.1f} minutes")
 
-            conv_info = results.get('convergence_info', {})
-
-            print(f"\n📊 {strategy.upper()} FINAL RESULTS:")
-            print(f"   🎯 Final Test Accuracy: {final_acc:.2f}%")
-            print(f"   🏆 Best Test Accuracy: {best_acc:.2f}%")
-            print(f"   ⏱️  Total Training Time: {total_training_time:.1f}s")
-            print(f"   🕒 Total Experiment Time: {experiment_time:.1f}s")
-            print(f"   📚 Avg Epochs per Client: {avg_epochs_per_round:.1f}")
-            print(f"   ⏹️  Total Early Stops: {total_early_stops}")
-
-            if conv_info.get('stopped_early', False):
-                print(f"   🛑 Early stopping at round: {conv_info['stopped_at_round']}")
-                print(f"   🎯 Best accuracy: {conv_info['best_accuracy']:.2f}% at round {conv_info['best_round']}")
-            else:
-                print(f"   ✅ Completed all {conv_info.get('completed_rounds', num_rounds)} rounds")
-
-    # Generate comprehensive visualizations
+    # Generate convergence analysis
     print(f"\n{'='*80}")
-    print("📊 GENERATING FASHION-MNIST ANALYSIS PLOTS")
+    print("GENERATING CONVERGENCE EFFICIENCY ANALYSIS")
     print(f"{'='*80}")
 
-    plot_fashion_mnist_comprehensive_results(all_results, strategies)
-    plot_fashion_mnist_accuracy_only(all_results, strategies)
+    analysis_summary = analyze_comprehensive_research_performance_mnist_early_stop(
+        all_results, strategies, all_straggler_trackers, all_efficiency_trackers
+    )
+    plot_convergence_analysis_mnist(all_results, strategies)
 
-    # Print final comparison table
-    print(f"\n{'='*80}")
-    print(f"📋 FINAL COMPARISON SUMMARY - FASHION-MNIST")
-    print(f"{'='*80}")
-    print(f"{'Strategy':<10} | {'Final':<6} | {'Best':<6} | {'Time':<7} | {'Efficiency':<10} | {'Status':<15}")
-    print("-" * 80)
+    return all_results, all_straggler_trackers, all_efficiency_trackers, analysis_summary
 
-    for i, strategy in enumerate(strategies):
-        if all_results[i]['test_accuracies']:
-            final_acc = all_results[i]['test_accuracies'][-1]
-            best_acc = max(all_results[i]['test_accuracies'])
-            total_time = sum(all_results[i]['round_times'])
-            efficiency = final_acc / (total_time / 60)  # Accuracy per minute
+# =================== CLUSTER ENVIRONMENT SETUP ===================
 
-            conv_info = all_results[i].get('convergence_info', {})
-            status = f"Early@{conv_info['stopped_at_round']}" if conv_info.get('stopped_early') else "Completed"
+def setup_research_environment():
+    """Setup research-grade environment for MNIST"""
+    plt.ioff()
 
-            print(f"{strategy.upper():<10} | {final_acc:5.1f}% | {best_acc:5.1f}% | {total_time:6.0f}s | {efficiency:8.1f} | {status:<15}")
+    if torch.cuda.is_available():
+        print(f"CUDA available: {torch.cuda.get_device_name()}")
+        print(f"   Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+    else:
+        print("CUDA not available, using CPU")
 
-    # Print DLA-specific analysis
-    dla_results = None
-    fedavg_results = None
-    for i, strategy in enumerate(strategies):
-        if strategy == "dla":
-            dla_results = all_results[i]
-        elif strategy == "fedavg":
-            fedavg_results = all_results[i]
+    os.makedirs('./data', exist_ok=True)
+    os.makedirs('./results', exist_ok=True)
+    os.makedirs('./plots', exist_ok=True)
 
-    if dla_results and fedavg_results and dla_results['test_accuracies'] and fedavg_results['test_accuracies']:
-        dla_final = dla_results['test_accuracies'][-1]
-        fedavg_final = fedavg_results['test_accuracies'][-1]
-        dla_time = sum(dla_results['round_times'])
-        fedavg_time = sum(fedavg_results['round_times'])
+    print("Research environment setup complete")
 
-        accuracy_ratio = (dla_final / fedavg_final) * 100
-        time_savings = ((fedavg_time - dla_time) / fedavg_time) * 100
+def save_plot_for_publication():
+    """Replace plt.show() with publication-quality saving"""
+    original_show = plt.show
 
-        print(f"\n{'='*80}")
-        print(f"🎯 DLA PERFORMANCE ANALYSIS - FASHION-MNIST")
-        print(f"{'='*80}")
-        print(f"📊 DLA achieved {accuracy_ratio:.1f}% of FedAvg's accuracy")
-        print(f"⏰ DLA provided {time_savings:.1f}% time savings vs FedAvg")
-        print(f"🎨 Fashion-MNIST complexity: Perfect testbed for partial training evaluation")
-        print(f"👗 Realistic scenario: Fashion retailers with specialized inventories")
+    def publication_show(filename_prefix="plot"):
+        timestamp = int(time.time())
+        filename = f"./plots/{filename_prefix}_{timestamp}.png"
+        plt.savefig(filename, dpi=300, bbox_inches='tight', facecolor='white')
+        print(f"Publication-quality plot saved: {filename}")
+        plt.close()
 
-    return all_results
+    plt.show = publication_show
 
-# --- 12. Main Execution with Cluster Optimizations ---
+# =================== MAIN EXECUTION ===================
+
 if __name__ == "__main__":
-    # Setup cluster environment
-    setup_cluster_environment()
-    save_plot_instead_of_show()
-
-    # Get optimized settings for cluster
-    cluster_settings = optimize_for_cluster()
-
-    # Research-grade configuration for Fashion-MNIST
-    NUM_CLIENTS = cluster_settings['num_clients']
+    setup_research_environment()
+    save_plot_for_publication()
+    
+    NUM_CLIENTS = 50
     MAX_LOCAL_EPOCHS = 15
-    NUM_ROUNDS = 100
-    EARLY_STOP_PATIENCE = 18  # Slightly higher for Fashion-MNIST complexity
+    NUM_ROUNDS = 300  # Higher max since we expect early stopping
 
-    print("👗 Starting Enhanced Fashion-MNIST Federated Learning Research Experiment")
-    print(f"⚙️  Configuration: {NUM_CLIENTS} clients, {MAX_LOCAL_EPOCHS} epochs, {NUM_ROUNDS} rounds")
-    print(f"🎨 Fashion-MNIST: 10 clothing categories, 60K training samples, 10K test samples")
+    print("Starting Research-Grade MNIST Federated Learning with Global Early Stopping")
+    print(f"Max Rounds: {NUM_ROUNDS} | Early Stop Target: 95.0% accuracy")
+    print(f"Clients: {NUM_CLIENTS} | Strategies: FedAvg, FedPMT, FedDrop, DLA")
 
-    # Run Fashion-MNIST experiment with error handling
-    print("\n" + "="*100)
-    print("👗 RUNNING ENHANCED FASHION-MNIST EXPERIMENT")
-    print("="*100)
-
-    fashion_mnist_results = safe_experiment_runner(
-        run_fashion_mnist_federated_experiment,
+    # Run research-grade experiment with early stopping
+    experiment_results = run_research_grade_mnist_experiment_early_stop(
         iid=True,
         num_rounds=NUM_ROUNDS,
         num_clients=NUM_CLIENTS,
-        max_local_epochs=MAX_LOCAL_EPOCHS,
-        early_stop_patience=EARLY_STOP_PATIENCE
+        max_local_epochs=MAX_LOCAL_EPOCHS
     )
 
-    # Uncomment to run Non-IID experiment (Fashion stores with specialized inventories)
-    """
-    print("\n" + "="*100)
-    print("🏪 RUNNING NON-IID FASHION-MNIST (SPECIALIZED STORES)")
-    print("="*100)
-    fashion_mnist_noniid_results = safe_experiment_runner(
-        run_fashion_mnist_federated_experiment,
-        iid=False,
-        num_rounds=NUM_ROUNDS,
-        num_clients=NUM_CLIENTS,
-        max_local_epochs=MAX_LOCAL_EPOCHS,
-        early_stop_patience=EARLY_STOP_PATIENCE
-    )
-    """
+    if experiment_results:
+        all_results, straggler_trackers, efficiency_trackers, analysis_summary = experiment_results
 
-    if fashion_mnist_results:
-        print("\n🎉 Enhanced Fashion-MNIST Federated Learning Research Complete!")
-        print("📊 Results demonstrate DLA performance on fashion recognition tasks")
-        print("👗 Fashion-MNIST provides ideal complexity for evaluating partial training strategies")
-        print("🏪 Realistic federated scenario: Fashion retailers with diverse inventories")
+        print("\nResearch-Grade MNIST Early Stopping Experiment Complete!")
+        print("Convergence efficiency analysis generated!")
 
-        # Save results to JSON
-        print("\n💾 Saving results...")
-        serializable_results = []
-        for result in fashion_mnist_results:
-            serializable_result = {}
-            for key, value in result.items():
-                if isinstance(value, dict):
-                    serializable_result[key] = {str(k): (v.tolist() if hasattr(v, 'tolist') else v)
-                                              for k, v in value.items()}
-                elif hasattr(value, 'tolist'):
-                    serializable_result[key] = value.tolist()
-                else:
-                    serializable_result[key] = value
-            serializable_results.append(serializable_result)
+        # Save results
+        print("\nSaving convergence analysis results...")
+        try:
+            serializable_results = []
+            for result in all_results:
+                serializable_result = prepare_results_for_json(result)
+                serializable_results.append(serializable_result)
 
-        with open('./results/fashion_mnist_results.json', 'w') as f:
-            json.dump(serializable_results, f, indent=2)
+            research_data = {
+                'experiment_results': serializable_results,
+                'analysis_summary': prepare_results_for_json(analysis_summary),
+                'experiment_config': {
+                    'max_rounds': NUM_ROUNDS,
+                    'num_clients': NUM_CLIENTS,
+                    'max_local_epochs': MAX_LOCAL_EPOCHS,
+                    'early_stopping': True,
+                    'convergence_threshold': 95.0,
+                    'patience': 15,
+                    'strategies': ["fedavg", "fedpmt", "feddrop", "dla"],
+                    'dataset': 'MNIST',
+                    'architecture': 'MLP'
+                },
+                'metadata': {
+                    'timestamp': time.time(),
+                    'convergence_framework': 'Global Early Stopping',
+                    'best_practices_applied': [
+                        'Global early stopping with convergence detection',
+                        'Dataset-specific convergence thresholds',
+                        'Efficiency-to-convergence metrics',
+                        'Comprehensive convergence tracking',
+                        'Realistic federated learning scenarios'
+                    ]
+                }
+            }
 
-        print("💾 Results saved to ./results/fashion_mnist_results.json")
-        print("📊 Plots saved to ./plots/ directory")
-        print("✅ Experiment completed successfully!")
+            with open('./results/mnist_early_stop_results.json', 'w') as f:
+                json.dump(research_data, f, indent=2)
+
+            print("Results saved to ./results/mnist_early_stop_results.json")
+            print("Publication-quality plots saved to ./plots/ directory")
+            print("MNIST Global Early Stopping experiment completed successfully!")
+
+        except Exception as e:
+            print(f"Warning: Could not save JSON results due to: {e}")
+            print("Experiment completed successfully, but results not saved to file")
+
     else:
-        print("❌ Experiment failed!")
+        print("MNIST early stopping experiment failed!")
         sys.exit(1)
